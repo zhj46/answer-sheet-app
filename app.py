@@ -7,7 +7,6 @@ import json
 from datetime import datetime
 import os
 from supabase import create_client, Client
-from openai import OpenAI
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
@@ -17,18 +16,19 @@ import requests
 st.set_page_config(page_title="个人答题卡智能阅卷系统", layout="wide")
 st.title("📄 个人答题卡智能阅卷系统")
 
-# 从 Streamlit Secrets 读取敏感信息
+# 读取 Supabase 配置
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = st.secrets.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
-if not all([SUPABASE_URL, SUPABASE_KEY, OPENAI_API_KEY]):
-    st.error("⚠️ 缺少配置。请点击网页右上角的 'Settings' -> 'Secrets'，填入 SUPABASE_URL, SUPABASE_KEY, OPENAI_API_KEY。")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("⚠️ 缺少配置。请点击网页右上角的 'Settings' -> 'Secrets'，填入 SUPABASE_URL, SUPABASE_KEY。")
     st.stop()
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    st.error(f"数据库连接失败，请检查 Supabase 是否处于 Paused 状态: {e}")
+    st.stop()
 
 # --- 2. 数据库操作函数 ---
 def get_exams():
@@ -59,37 +59,7 @@ def save_grading_result(result_data):
     res = supabase.table("grading_results").upsert(result_data).execute()
     return res.data
 
-# --- 3. 图像处理与 OMR (选择题识别模拟) ---
-def process_omr_image(image_bytes, answer_key):
-    # 注意：这里为了跑通流程，使用了模拟结果。
-    # 真正的OMR需要极复杂的 OpenCV 坐标计算，建议后续人工核对选择题。
-    mock_results = {q: "A" for q in answer_key.keys()} 
-    return mock_results
-
-# --- 4. AI 辅助阅卷 ---
-def grade_subjective_with_ai(question_no, student_answer, reference_answer, full_marks, rubric=""):
-    prompt = f"""
-    你是一个严谨的阅卷老师。请根据信息批改主观题。
-    题目: {question_no}, 满分: {full_marks}
-    参考答案: {reference_answer}
-    学生作答: {student_answer}
-    
-    请输出JSON格式: {{"suggested_score": 分数(数字), "feedback": "详细点评(优点+不足)"}}
-    """
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini", # 如果用的是国内中转API，请换成对应的模型名，如 "gpt-3.5-turbo"
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.1
-        )
-        result = json.loads(response.choices[0].message.content)
-        result['suggested_score'] = min(float(result.get('suggested_score', 0)), float(full_marks))
-        return result
-    except Exception as e:
-        return {"suggested_score": 0, "feedback": f"AI评分异常: {str(e)}"}
-
-# --- 5. PDF 导出 ---
+# --- 3. PDF 导出 ---
 def generate_annotated_pdf(original_image_url, grading_results, total_score, full_score):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -126,7 +96,7 @@ def generate_annotated_pdf(original_image_url, grading_results, total_score, ful
     buffer.seek(0)
     return buffer
 
-# --- 6. Streamlit UI ---
+# --- 4. Streamlit UI ---
 if 'current_exam_id' not in st.session_state:
     st.session_state.current_exam_id = None
 if 'questions' not in st.session_state:
@@ -160,7 +130,7 @@ if st.session_state.current_exam_id is None:
     st.info("👈 请在左侧创建或选择一份试卷以开始。")
     st.stop()
 
-tab1, tab2, tab3, tab4 = st.tabs(["📝 制卡配置", "📸 上传原卷", "🤖 AI 辅助阅卷", "📊 成绩汇总与导出"])
+tab1, tab2, tab3, tab4 = st.tabs(["📝 制卡配置", "📸 上传原卷", "✍️ 人工阅卷", "📊 成绩汇总与导出"])
 
 with tab1:
     st.subheader("调整题目信息")
@@ -194,42 +164,40 @@ with tab2:
             st.info(f"当前关联的原卷图片：{st.session_state.current_image_url}")
 
 with tab3:
-    st.subheader("AI 辅助主观题评分")
+    st.subheader("纯人工阅卷")
+    # 获取所有主观题
     subjective_questions = [q for q in st.session_state.questions if q['type'] != '选择题']
     
     if not subjective_questions:
         st.info("当前试卷没有主观题。")
     else:
-        q_options = {f"第{q['no']}题": q for q in subjective_questions}
-        selected_q_key = st.selectbox("选择题目", options=list(q_options.keys()))
+        q_options = {f"第{q['no']}题 ({q['full']}分)": q for q in subjective_questions}
+        selected_q_key = st.selectbox("选择要批改的题目", options=list(q_options.keys()))
         selected_q = q_options[selected_q_key]
         
         col1, col2 = st.columns(2)
         with col1:
-            student_answer = st.text_area("学生作答内容", height=150)
-        with col2:
-            st.info(f"**参考答案:**\n{selected_q.get('ref', '未填写')}")
+            st.write("**参考答案：**")
+            st.info(selected_q.get('ref', '未填写'))
+            st.write("**评分细则：**")
+            st.write(selected_q.get('rubric', '未填写'))
         
-        if st.button("调用 AI 评分"):
-            if not student_answer:
-                st.warning("请先输入学生作答内容。")
-            else:
-                with st.spinner("AI 正在分析..."):
-                    ai_result = grade_subjective_with_ai(selected_q['no'], student_answer, selected_q.get('ref', ''), selected_q['full'])
-                    
-                    final_score = st.number_input("确认或修改得分", min_value=0.0, max_value=float(selected_q['full']), value=float(ai_result.get('suggested_score', 0)), step=0.5)
-                    st.write(f"**AI 点评:** {ai_result.get('feedback', '')}")
-                    
-                    if st.button("确认并保存该题得分"):
-                        result_record = {
-                            "exam_id": st.session_state.current_exam_id,
-                            "question_no": selected_q['no'],
-                            "score": final_score,
-                            "full_marks": selected_q['full'],
-                            "feedback": ai_result.get('feedback', '')
-                        }
-                        save_grading_result(result_record)
-                        st.success(f"第{selected_q['no']}题得分已保存至云端！")
+        with col2:
+            st.write("**评分操作：**")
+            # 这里直接让用户输入分数和评语
+            manual_score = st.number_input("输入得分", min_value=0.0, max_value=float(selected_q['full']), value=0.0, step=0.5)
+            manual_feedback = st.text_area("批改评语/备注 (可选)", height=100)
+            
+            if st.button("保存该题得分"):
+                result_record = {
+                    "exam_id": st.session_state.current_exam_id,
+                    "question_no": selected_q['no'],
+                    "score": manual_score,
+                    "full_marks": selected_q['full'],
+                    "feedback": manual_feedback
+                }
+                save_grading_result(result_record)
+                st.success(f"第{selected_q['no']}题得分已保存至云端！")
 
 with tab4:
     st.subheader("成绩汇总")
